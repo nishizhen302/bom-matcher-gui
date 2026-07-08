@@ -48,6 +48,7 @@ class Api:
         self._window = None
         self.bom_file = None
         self.code_file = None
+        self.final_file = None
         self.output_file = None
         self.session = None
         self.busy = False
@@ -107,34 +108,27 @@ class Api:
             return None
         return self.set_file('code', p)
 
+    def pick_final(self):
+        p = self._pick_excel()
+        if not p:
+            return None
+        return self.set_file('final', p)
+
     def set_file(self, kind, path):
-        """kind: bom|code。拖放与对话框共用入口。"""
+        """kind: bom|code|final。拖放与对话框共用入口。"""
         if not path or not os.path.isfile(path):
             return {'error': '文件不存在'}
         if not path.lower().endswith(('.xlsx', '.xls')):
             return {'error': '请选择 Excel 文件 (.xlsx/.xls)'}
         if kind == 'bom':
             self.bom_file = path
-            if not self.output_file:
-                self.output_file = self._default_output()
+            # 输出固定跟 BOM 源文件同路径（UI 已去掉输出文件框）
+            self.output_file = self._default_output()
+        elif kind == 'final':
+            self.final_file = path
         else:
             self.code_file = path
-        info = self._file_info(path)
-        info['output'] = self.output_file or ''
-        return info
-
-    def pick_output(self):
-        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        r = self._window.create_file_dialog(
-            webview.SAVE_DIALOG, save_filename=f'BOM_匹配结果_{stamp}.xlsx',
-            file_types=('Excel 文件 (*.xlsx)',))
-        if r:
-            p = r[0] if isinstance(r, (list, tuple)) else r
-            if not p.lower().endswith('.xlsx'):
-                p += '.xlsx'
-            self.output_file = p
-            return p
-        return None
+        return self._file_info(path)
 
     # ---------- 匹配 ----------
     def start_match(self):
@@ -328,7 +322,7 @@ class Api:
             path = files[0].get('pywebviewFullPath')
             # 拖放落点由 JS 在 dragover 时记录（DOM 事件序列化不含可靠的 target 信息）
             zone = self._window.evaluate_js('window.__lastDropZone')
-            if not path or zone not in ('bom', 'code'):
+            if not path or zone not in ('bom', 'code', 'final'):
                 return
             info = self.set_file(zone, path)
             payload = json.dumps(info, ensure_ascii=False)
@@ -346,19 +340,14 @@ class Api:
 
     # ---------- 生产版（审核后清理导出） ----------
     def make_final(self):
-        """选中人工审核过的结果 Excel，清理聚合后生成 <原名>_生产版.xlsx 并打开。
-        不依赖匹配会话，历史结果文件也可用。"""
+        """把拖入的审核后结果 Excel 清理聚合成 <原名>_生产版.xlsx（同路径）。
+        不依赖匹配会话，历史结果文件也可用；不自动打开，由界面提示完成状态。"""
         from bom_matcher.finalize import finalize
-        r = self._window.create_file_dialog(
-            webview.OPEN_DIALOG, allow_multiple=False,
-            directory=os.path.dirname(self.output_file) if self.output_file else '',
-            file_types=('Excel 文件 (*.xlsx)',))
-        if not r:
-            return None
-        path = r[0] if isinstance(r, (list, tuple)) else r
+        if not self.final_file:
+            return {'error': '请先拖入审核后的匹配结果文件'}
         logs = []
         try:
-            out = finalize(path, log=logs.append)
+            out = finalize(self.final_file, log=logs.append)
         except PermissionError:
             return {'error': '写入失败：生产版文件正被 Excel 占用，请先关闭它'}
         except ValueError as e:
@@ -366,10 +355,6 @@ class Api:
         except Exception as e:
             return {'error': f'生成失败: {type(e).__name__}: {e}'}
         warn = next((m for m in logs if m.startswith('警告')), '')
-        try:
-            os.startfile(out)
-        except OSError:
-            pass
         return {'ok': True, 'output': out,
                 'name': os.path.basename(out), 'warn': warn}
 

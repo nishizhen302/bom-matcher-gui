@@ -147,22 +147,6 @@ svg.ic { width: 1em; height: 1em; stroke: currentColor; stroke-width: 2;
   font-size: 14px; display: none; }
 .dropzone.loaded .dz-check { display: block; }
 
-/* 输出行 */
-.outrow { display: flex; gap: 8px; align-items: stretch; }
-.outrow .path {
-  flex: 1; padding: 9px 12px; font-size: 11px; color: var(--text-2);
-  border: 1px solid var(--border); border-radius: var(--radius-sm);
-  background: var(--panel); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  direction: rtl; text-align: left;
-}
-.outrow .path span { direction: ltr; unicode-bidi: embed; }
-.iconbtn {
-  padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius-sm);
-  background: var(--panel); color: var(--text-2); cursor: pointer; font-size: 15px;
-  display: flex; align-items: center; transition: all 0.15s;
-}
-.iconbtn:hover { color: var(--accent); border-color: var(--accent); }
-
 /* CTA */
 .cta {
   margin-top: auto; width: 100%; padding: 15px; border: none; cursor: pointer;
@@ -178,6 +162,13 @@ svg.ic { width: 1em; height: 1em; stroke: currentColor; stroke-width: 2;
   animation: spin 0.7s linear infinite; }
 .cta.running .spinner { display: block; }
 .cta.running .ic-zap { display: none; }
+/* 绿色生产版 CTA：紧贴开始匹配键下方，样式同款 */
+.cta.final { margin-top: 0; background: var(--ok);
+  box-shadow: 0 0 20px var(--ok-dim); }
+.cta.final:hover:not(:disabled) { background: var(--ok); filter: brightness(1.12);
+  transform: translateY(-1px); }
+:root[data-theme="dark"] .cta.final { color: #06301b; }
+:root[data-theme="dark"] .cta.final .spinner { border-color: #06301b; border-top-color: transparent; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ============ 统计卡片 ============ */
@@ -397,10 +388,12 @@ table.review .st.confirmed { color: var(--text-3); }
         </div>
       </div>
       <div>
-        <div class="label">输出文件</div>
-        <div class="outrow">
-          <div class="path mono" id="outPath"><span>选择 BOM 后自动生成</span></div>
-          <button class="iconbtn" id="btnOut" title="另存为..."><svg class="ic" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
+        <div class="label">审核后 BOM（生产版）</div>
+        <div class="dropzone empty" id="dzFinal" title="匹配结果经人工审核（手填料号、可追加无位号的 PCB 料号行）后拖入，一键清理聚合出 6 列生产版">
+          <span class="dz-check"><svg class="ic" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span>
+          <span class="dz-icon"><svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="m9 15 2 2 4-4"/></svg></span>
+          <div class="dz-name" id="finalName">拖入或点击选择审核后的匹配结果</div>
+          <div class="dz-meta" id="finalMeta">删NC/非采购项 · 重聚合 · 输出同路径</div>
         </div>
       </div>
       <button class="cta" id="btnRun" disabled>
@@ -408,8 +401,10 @@ table.review .st.confirmed { color: var(--text-3); }
         <svg class="ic ic-zap" viewBox="0 0 24 24"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
         <span id="runText">开始匹配</span>
       </button>
-      <button class="abtn" id="btnFinal" style="flex:none;padding:9px" title="选中人工审核过的匹配结果，删NC/非采购项/汇总明细，重新聚合出 6 列生产版">
-        <svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="m9 15 2 2 4-4"/></svg>生成生产版（审核后）
+      <button class="cta final" id="btnFinal" disabled>
+        <span class="spinner"></span>
+        <svg class="ic ic-zap" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg>
+        <span id="finalText">生成生产版</span>
       </button>
     </div>
 
@@ -503,7 +498,7 @@ table.review .st.confirmed { color: var(--text-3); }
 const $ = id => document.getElementById(id);
 let api = null;
 let running = false;
-let hasBom = false, hasCode = false;
+let hasBom = false, hasCode = false, hasFinal = false, finalizing = false;
 let currentReviewIndex = null;
 let logLines = 0;
 const MAX_LOG_LINES = 600;
@@ -588,28 +583,26 @@ function bindDropzone(el, kind, pickFn) {
     window.__dropZone = null;
   };
 }
+const ZONES = {
+  bom:   { dz: 'dzBom',   name: 'bomName',   meta: 'bomMeta',   label: ' BOM 清单' },
+  code:  { dz: 'dzCode',  name: 'codeName',  meta: 'codeMeta',  label: '编码表' },
+  final: { dz: 'dzFinal', name: 'finalName', meta: 'finalMeta', label: '审核后 BOM' },
+};
 function fileLoaded(kind, info) {
-  const dz = kind === 'bom' ? $('dzBom') : $('dzCode');
+  const z = ZONES[kind];
+  const dz = $(z.dz);
   dz.classList.remove('empty'); dz.classList.add('loaded');
-  if (kind === 'bom') {
-    hasBom = true;
-    $('bomName').textContent = info.name;
-    $('bomMeta').textContent = info.size + ' · 已加载';
-  } else {
-    hasCode = true;
-    $('codeName').textContent = info.name;
-    $('codeMeta').textContent = info.size + ' · 已加载';
-  }
-  if (info.output) setOutputPath(info.output);
-  log('<span class="hl">≫ 载入' + (kind === 'bom' ? ' BOM 清单' : '编码表') + ':</span> ' + esc(info.name) + ' <span class="code-ok">✓</span>', 'sys');
+  if (kind === 'bom') hasBom = true;
+  else if (kind === 'code') hasCode = true;
+  else hasFinal = true;
+  $(z.name).textContent = info.name;
+  $(z.meta).textContent = info.size + ' · 已加载';
+  log('<span class="hl">≫ 载入' + z.label + ':</span> ' + esc(info.name) + ' <span class="code-ok">✓</span>', 'sys');
   updateCta();
-}
-function setOutputPath(p) {
-  $('outPath').innerHTML = '<span>' + esc(p) + '</span>';
-  $('outPath').title = p;
 }
 function updateCta() {
   $('btnRun').disabled = running || !hasBom || !hasCode;
+  $('btnFinal').disabled = finalizing || running || !hasFinal;
 }
 
 /* ---------- 统计 ---------- */
@@ -825,24 +818,36 @@ $('btnRun').onclick = async () => {
   setStatus('正在匹配…', 'var(--accent)');
   $('actions').classList.remove('show');
   $('elapsed').textContent = '';
-  if (r.output) setOutputPath(r.output);
   switchTab('log');
   log('<span class="hl">≫ 开始匹配任务</span> ' + new Date().toLocaleTimeString('zh-CN', { hour12: false }), 'sys');
 };
 
-/* ---------- 其他按钮 ---------- */
-$('btnOut').onclick = async () => {
-  if (!api || running) return;
-  const p = await api.pick_output();
-  if (p) setOutputPath(p);
-};
+/* ---------- 生成生产版 ---------- */
 $('btnFinal').onclick = async () => {
-  if (!api) return;
+  if (!api || finalizing || $('btnFinal').disabled) return;
+  finalizing = true;
+  $('btnFinal').classList.add('running');
+  $('finalText').textContent = '生成中…';
+  setStatus('正在生成生产版…', 'var(--ok)');
   const r = await api.make_final();
-  if (!r) return;                       // 用户取消了文件选择
-  if (r.error) { toast(r.error, true); return; }
-  toast('生产版已生成：' + r.name);
-  if (r.warn) toast(r.warn, true);
+  finalizing = false;
+  $('btnFinal').classList.remove('running');
+  $('finalText').textContent = '生成生产版';
+  updateCta();
+  if (!r || r.error) {
+    toast((r && r.error) || '生成失败', true);
+    setStatus('生产版生成失败', 'var(--err)');
+    return;
+  }
+  setStatus('生产版已生成', 'var(--ok)');
+  $('finalMeta').textContent = '已生成 → ' + r.name;
+  log('<span class="hl">≫ 生产版已生成:</span> ' + esc(r.output) + ' <span class="code-ok">✓</span>', 'sys');
+  if (r.warn) {
+    log('<span class="miss">≫ ' + esc(r.warn) + '</span>', 'sys');
+    toast(r.warn, true);
+  } else {
+    toast('生产版已生成：' + r.name + '（与审核文件同路径）');
+  }
 };
 $('btnOpenFile').onclick = () => api && api.open_result();
 $('btnOpenDir').onclick = () => api && api.open_folder();
@@ -854,6 +859,7 @@ window.addEventListener('pywebviewready', async () => {
   api = window.pywebview.api;
   bindDropzone($('dzBom'), 'bom', () => api.pick_bom());
   bindDropzone($('dzCode'), 'code', () => api.pick_code());
+  bindDropzone($('dzFinal'), 'final', () => api.pick_final());
   setStatus('系统就绪');
   try {
     const t = await api.get_pref('theme');
