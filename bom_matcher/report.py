@@ -17,13 +17,25 @@ def _is_nc(part):
     return bool(NC_RE.search(str(part).upper()))
 
 
+def _is_review(r):
+    return len(r) > 8 and '[需确认]' in str(r[8])
+
+
 def sort_rows(rows):
-    """稳定排序：正常(按料号) → 非采购项 → 未匹配 → NC"""
-    rows.sort(key=lambda r: (
-        _is_nc(r[1]),
-        r[4] == UNMATCHED,
-        r[4],
-    ))
+    """稳定排序：正常(按料号) → [需确认] → 非采购项 → 未匹配 → NC。
+    带颜色的行集中放在表尾一个块里，便于逐块人工处理。"""
+    def tier(r):
+        if _is_nc(r[1]):
+            return 4
+        if r[4] == UNMATCHED:
+            return 3
+        if r[4] == MECH_PN:
+            return 2
+        if _is_review(r):
+            return 1
+        return 0
+
+    rows.sort(key=lambda r: (tier(r), r[4] == UNMATCHED, r[4]))
     return rows
 
 
