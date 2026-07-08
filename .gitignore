@@ -1,0 +1,7 @@
+__pycache__/
+build/
+dist/
+*.exe
+BOM_匹配结果*.xlsx
+~$*
+tests/golden/*.xlsx
