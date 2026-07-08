@@ -49,6 +49,7 @@ class Api:
         self.bom_file = None
         self.code_file = None
         self.final_file = None
+        self.final_output = None
         self.output_file = None
         self.session = None
         self.busy = False
@@ -355,8 +356,21 @@ class Api:
         except Exception as e:
             return {'error': f'生成失败: {type(e).__name__}: {e}'}
         warn = next((m for m in logs if m.startswith('警告')), '')
+        self.final_output = out
         return {'ok': True, 'output': out,
                 'name': os.path.basename(out), 'warn': warn}
+
+    def open_final(self):
+        if self.final_output and os.path.isfile(self.final_output):
+            os.startfile(self.final_output)
+            return True
+        return False
+
+    def open_final_folder(self):
+        if self.final_output and os.path.isfile(self.final_output):
+            subprocess.Popen(['explorer', '/select,', self.final_output])
+            return True
+        return False
 
     # ---------- 结果文件 ----------
     def open_result(self):
