@@ -222,6 +222,21 @@ class Engine:
                 allc = [e for e, _ in cands]
                 allc.sort(key=lambda e: (-(e.volt or 0), -usage.get(e.pn, 0), e.pn))
                 self._cap_selection[key] = allc[0].pn
+        # 合并：同(容值,封装)选出了多个料号时，若最高电压者能覆盖某组的电压要求，
+        # 该组统一到它（高压可替代低压，减少物料种类）
+        clusters = {}
+        for key in self._cap_selection:
+            clusters.setdefault((key[0], key[1]), []).append(key)
+        for keys in clusters.values():
+            pns = {self._cap_selection[k] for k in keys}
+            if len(pns) <= 1:
+                continue
+            best = max((self.by_pn[p] for p in pns), key=lambda e: (e.volt or 0, e.pn))
+            if best.volt is None:
+                continue
+            for k in keys:
+                if k[2] == 0 or best.volt >= k[2]:
+                    self._cap_selection[k] = best.pn
 
     def _match_c(self, it):
         pf, volt = P.parse_c_value(it.body)
@@ -419,11 +434,18 @@ class Engine:
                 if e.pn.startswith('Y0611') and needle in e.spec]
         if not hits:
             return None
-        # 同频率多个封装时，优先规格里含BOM封装字样的（如 smd3225）
-        hits.sort(key=lambda e: (0 if (fpn and fpn in e.norm) else 1, e.pn))
+        # 封装命中的优先；一旦有封装命中，其他封装的就不再作为候选干扰
+        pkg_hits = [e for e in hits if fpn and fpn in e.norm]
+        if pkg_hits:
+            pkg_hits.sort(key=lambda e: e.pn)
+            e = pkg_hits[0]
+            return Match(e.pn, e.name, e.spec,
+                         reason=f'晶振频率{needle}MHz+封装{it.fp}',
+                         candidates=[(c.pn, c.name, c.spec) for c in pkg_hits[1:4]])
+        hits.sort(key=lambda e: e.pn)
         e = hits[0]
-        reason = f'晶振频率{needle}MHz' + ('+封装' + it.fp if fpn and fpn in e.norm else '')
-        return Match(e.pn, e.name, e.spec, reason=reason,
+        return Match(e.pn, e.name, e.spec, confidence='review',
+                     reason=f'晶振频率{needle}MHz;封装无精确对应,请确认',
                      candidates=[(c.pn, c.name, c.spec) for c in hits[1:4]])
 
     def _match_ldo(self, it, body_u):

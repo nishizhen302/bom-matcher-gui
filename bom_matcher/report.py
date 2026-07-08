@@ -85,6 +85,7 @@ def write_excel(rows, output_file):
         'gray': openpyxl.styles.PatternFill('solid', start_color='D9D9D9'),
         'green': openpyxl.styles.PatternFill('solid', start_color='C6EFCE'),
         'mech': openpyxl.styles.PatternFill('solid', start_color='FFF2CC'),
+        'review': openpyxl.styles.PatternFill('solid', start_color='F8CBAD'),
     }
     for col in range(1, N_COLS + 1):
         ws.cell(row=1, column=col).border = border
@@ -101,6 +102,8 @@ def write_excel(rows, output_file):
             fill = fills['blue']
         elif data[4] == UNMATCHED:
             fill = fills['yellow']
+        elif len(data) > 8 and '[需确认]' in str(data[8]):
+            fill = fills['review']
         elif data[4] == MECH_PN:
             fill = fills['mech']
         elif is_rep:

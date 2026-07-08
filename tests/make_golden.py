@@ -9,7 +9,8 @@ import sys, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 import openpyxl
 
-FILLS = {'00FFFF00': 'U', '000099CC': 'N', '00C6EFCE': 'S', '00D9D9D9': 'D'}
+FILLS = {'00FFFF00': 'U', '000099CC': 'N', '00C6EFCE': 'S', '00D9D9D9': 'D',
+         '00F8CBAD': 'R', '00FFF2CC': 'M'}
 
 
 def canon(path):
