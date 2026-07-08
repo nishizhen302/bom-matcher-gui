@@ -93,10 +93,17 @@ def main(bom=None, code=None, output=None, verbose=False, debug=False):
     cli = bom is None and code is None
     if cli:
         parser = argparse.ArgumentParser(description='BOM智能匹配工具')
-        parser.add_argument('--bom', required=True)
-        parser.add_argument('--code', required=True)
+        parser.add_argument('--bom')
+        parser.add_argument('--code')
         parser.add_argument('--output')
+        parser.add_argument('--finalize', metavar='结果.xlsx',
+                            help='读回人工审核后的结果文件，生成 <原名>_生产版.xlsx')
         args = parser.parse_args()
+        if args.finalize:
+            from bom_matcher.finalize import finalize
+            return finalize(args.finalize, args.output, log=_log)
+        if not (args.bom and args.code):
+            parser.error('--bom 和 --code 为必填（除非使用 --finalize）')
         bom, code, output = args.bom, args.code, args.output
 
     output = output or os.path.join(

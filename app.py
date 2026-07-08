@@ -344,6 +344,35 @@ class Api:
         self._window.dom.document.events.drop += DOMEventHandler(
             self._on_drop, prevent_default=True, stop_propagation=False)
 
+    # ---------- 生产版（审核后清理导出） ----------
+    def make_final(self):
+        """选中人工审核过的结果 Excel，清理聚合后生成 <原名>_生产版.xlsx 并打开。
+        不依赖匹配会话，历史结果文件也可用。"""
+        from bom_matcher.finalize import finalize
+        r = self._window.create_file_dialog(
+            webview.OPEN_DIALOG, allow_multiple=False,
+            directory=os.path.dirname(self.output_file) if self.output_file else '',
+            file_types=('Excel 文件 (*.xlsx)',))
+        if not r:
+            return None
+        path = r[0] if isinstance(r, (list, tuple)) else r
+        logs = []
+        try:
+            out = finalize(path, log=logs.append)
+        except PermissionError:
+            return {'error': '写入失败：生产版文件正被 Excel 占用，请先关闭它'}
+        except ValueError as e:
+            return {'error': str(e)}
+        except Exception as e:
+            return {'error': f'生成失败: {type(e).__name__}: {e}'}
+        warn = next((m for m in logs if m.startswith('警告')), '')
+        try:
+            os.startfile(out)
+        except OSError:
+            pass
+        return {'ok': True, 'output': out,
+                'name': os.path.basename(out), 'warn': warn}
+
     # ---------- 结果文件 ----------
     def open_result(self):
         if self.output_file and os.path.isfile(self.output_file):
