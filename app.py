@@ -10,11 +10,15 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+import webbrowser
 from datetime import datetime
 
 import webview
 
 import engine
+import version
 
 
 def resource_path(rel):
@@ -60,6 +64,53 @@ class Api:
 
     def win_close(self):
         self._window.destroy()
+
+    # ---------- 检查更新（仓库公开，匿名对比 GitHub main 分支） ----------
+    def _gh_json(self, url):
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'BomMatcher-UpdateCheck',
+            'Accept': 'application/vnd.github+json'})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            return json.loads(r.read().decode('utf-8'))
+
+    def check_update(self):
+        """对比本机 exe 打包时的提交与远端 main 最新提交。
+        返回 has_update / behind_by（落后几个提交）/ 当前版本号等。"""
+        info = version.get_local()
+        result = {
+            'current': info['version'], 'sha': info['sha'], 'date': info['date'],
+            'has_update': False, 'behind_by': 0, 'latest_sha': '',
+            'url': version.REPO_URL, 'error': None,
+        }
+        sha_full = info.get('sha_full')
+        if not sha_full:
+            result['error'] = '无法确定当前版本'
+            return result
+        try:
+            latest = self._gh_json(
+                f'https://api.github.com/repos/{version.REPO}/commits/main')
+            latest_sha = latest.get('sha', '')
+            result['latest_sha'] = latest_sha[:7]
+            if latest_sha and latest_sha != sha_full:
+                try:
+                    cmp = self._gh_json(
+                        f'https://api.github.com/repos/{version.REPO}'
+                        f'/compare/{sha_full}...{latest_sha}')
+                    if cmp.get('status') in ('ahead', 'diverged'):
+                        result['has_update'] = True
+                        result['behind_by'] = cmp.get('ahead_by', 0)
+                except Exception:
+                    # 无法比对（多半是本机提交未推送），只要 sha 不同就提示有更新
+                    result['has_update'] = True
+        except urllib.error.URLError:
+            result['error'] = '网络不可用，暂时无法检查更新'
+        except Exception as e:
+            result['error'] = f'检查失败: {type(e).__name__}'
+        return result
+
+    def open_repo(self):
+        webbrowser.open(version.REPO_URL)
+        return True
 
     # ---------- 偏好设置（皮肤等，存 %APPDATA%\BomMatcher，EXE 每次解压路径不同导致
     # 页面 localStorage 不跨启动，必须落盘到固定位置） ----------

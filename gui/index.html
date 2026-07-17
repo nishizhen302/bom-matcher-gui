@@ -93,7 +93,10 @@ svg.ic { width: 1em; height: 1em; stroke: currentColor; stroke-width: 2;
 .titlebar .brand { display: flex; align-items: center; gap: 8px; pointer-events: none; }
 .titlebar .brand .logo { color: var(--accent); font-size: 17px; display: flex; }
 .titlebar .brand .name { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; color: var(--text-1); }
-.titlebar .brand .ver { font-size: 10px; color: var(--text-3); font-weight: 400; margin-left: 4px; }
+.titlebar .brand .ver { font-size: 10px; color: var(--text-3); font-weight: 400; margin-left: 4px; pointer-events: auto; cursor: pointer; transition: color .15s; }
+.titlebar .brand .ver:hover { color: var(--text-1); }
+.titlebar .brand .ver.update { color: var(--accent); font-weight: 600; }
+.titlebar .brand .ver.update::after { content: ''; display: inline-block; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); margin-left: 4px; vertical-align: middle; }
 .titlebar .controls { display: flex; align-items: center; gap: 2px; }
 .tbtn {
   width: 34px; height: 30px; border: none; background: transparent; color: var(--text-2);
@@ -355,7 +358,7 @@ table.review .st.confirmed { color: var(--text-3); }
   <div class="titlebar pywebview-drag-region">
     <div class="brand">
       <span class="logo"><svg class="ic" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></svg></span>
-      <span class="name">BOM 匹配助手<span class="ver">v1.0</span></span>
+      <span class="name">BOM 匹配助手<span class="ver" id="verLabel" title="检查更新">v…</span></span>
     </div>
     <div class="controls">
       <button class="skin-toggle" id="skinToggle" title="切换皮肤">
@@ -864,6 +867,38 @@ $('btnOpenFinalDir').onclick = () => api && api.open_final_folder();
 $('btnMin').onclick = () => api && api.win_minimize();
 $('btnClose').onclick = () => api && api.win_close();
 
+/* ---------- 检查更新 ---------- */
+let updateInfo = null;
+async function checkUpdate(manual) {
+  if (!api) return;
+  const lbl = $('verLabel');
+  if (manual) { lbl.textContent = '检查中…'; toast('正在检查更新…'); }
+  let r;
+  try { r = await api.check_update(); } catch (e) { r = { error: '检查失败' }; }
+  updateInfo = r;
+  if (r.error) {
+    if (r.current && r.current !== '?') lbl.textContent = 'v' + r.current;
+    lbl.classList.remove('update');
+    lbl.title = r.error + '（点击重试）';
+    if (manual) toast(r.error, true);
+    return;
+  }
+  lbl.textContent = 'v' + r.current;
+  if (r.has_update) {
+    lbl.classList.add('update');
+    lbl.title = '远端已更新，落后 ' + r.behind_by + ' 个提交 · 点击打开仓库';
+    toast('有新版本！本机落后 ' + r.behind_by + ' 个提交，点左上角版本号更新');
+  } else {
+    lbl.classList.remove('update');
+    lbl.title = '已是最新版本 v' + r.current + '（点击重新检查）';
+    if (manual) toast('已是最新版本 v' + r.current);
+  }
+}
+$('verLabel').onclick = () => {
+  if (updateInfo && updateInfo.has_update) { api && api.open_repo(); }
+  else { checkUpdate(true); }
+};
+
 /* ---------- 初始化 ---------- */
 window.addEventListener('pywebviewready', async () => {
   api = window.pywebview.api;
@@ -878,6 +913,7 @@ window.addEventListener('pywebviewready', async () => {
       $('skinName').textContent = t === 'dark' ? '暗夜' : '清爽';
     }
   } catch (e) {}
+  checkUpdate(false);   // 启动静默检查更新
 });
 /* 阻止整窗默认拖放导航；落到拖放区之外时清空落点标记 */
 window.addEventListener('dragover', e => e.preventDefault());

@@ -5,3 +5,4 @@ dist/
 BOM_匹配结果*.xlsx
 ~$*
 tests/golden/*.xlsx
+_build_info.py
