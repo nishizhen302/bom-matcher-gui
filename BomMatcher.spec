@@ -24,7 +24,7 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[('gui', 'gui')],
+    datas=[('gui', 'gui'), ('orcad_dsn.tcl', '.')],
     hiddenimports=['_build_info'],
     hookspath=[],
     hooksconfig={},

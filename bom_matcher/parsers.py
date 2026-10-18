@@ -6,9 +6,12 @@
 import re
 
 CHIP_SIZES = {'0402', '0603', '0805', '1206', '1210', '1812', '2010', '2512'}
+METRIC_TO_INCH = {'1005': '0402', '1608': '0603', '2012': '0805', '3216': '1206',
+                  '3225': '1210', '4532': '1812', '5025': '2010', '6332': '2512'}
 
 # 值与精度之间常见分隔符：空格 % / _ -（"100R-5%"、"3K-5%"写法）
 _SEP = r'[\s%/_\-]'
+_SEP_R = r'[\s%/_\-,，+]'   # 阻值另认逗号（'240R,1%'）和 '+-1%'
 
 NC_RE = re.compile(r'(^|[^A-Z0-9])NC($|[^A-Z0-9])')
 
@@ -48,10 +51,14 @@ def parse_package(fp_or_spec, spec_mode=False):
     if not s:
         return '', None
     dims = parse_dims(s)
-    # 铝电解：CAPAE660X770N / AE660 -> AE660(直径6.60mm)
-    m = re.search(r'AE\s*(\d{3})', s)
+    # 铝电解：CAPAE660X770N / AE660 -> AE660(直径6.60mm)；CAPAE1040X1000N -> AE1040(10.40mm)
+    m = re.search(r'AE\s*(\d{3,4})(?=X|\b|_|$)', s)
     if m:
         return 'AE' + m.group(1), dims
+    # IPC-7351 命名（RESC1608X60N / CAPC3216X140N / LEDC1608X102N）里是公制尺寸，换成英制
+    m = re.match(r'^(?:RES|CAP|IND|LED)C(\d{4})X', s)
+    if m and m.group(1) in METRIC_TO_INCH:
+        return METRIC_TO_INCH[m.group(1)], dims
     # 贴片尺寸：第一个命中已知尺寸表的4位数字
     for m4 in re.findall(r'\d{4}', s):
         if m4 in CHIP_SIZES:
@@ -91,7 +98,8 @@ def is_chip_size(pkg):
 
 def parse_r_value(text):
     """'100R-5%'/'4K7'/'10K'/'0'/'100R*4' -> (欧姆值, 阵列个数) 或 None"""
-    s = str(text).strip().upper()
+    # Ω 的几种写法一律去掉：Ω / Ω(U+2126) / OHM / 繁体系统画的板子读出来的乱码 U+E5A1(Big5 的 Ω)
+    s = re.sub(r'OHMS?|[ΩΩ]', '', str(text).strip().upper())
     if not s:
         return None
     array_count = 1
@@ -99,7 +107,7 @@ def parse_r_value(text):
     if m:
         array_count = int(m.group(1))
         s = re.sub(r'\*\d+', '', s)
-    for tok in re.split(_SEP, s):
+    for tok in re.split(_SEP_R, s):
         tok = tok.strip()
         if not tok:
             continue
@@ -109,6 +117,9 @@ def parse_r_value(text):
         if m:
             val = float(m.group(1) + '.' + m.group(3))
             return val * _R_MULT[m.group(2)], array_count
+        m = re.fullmatch(r'(\d+\.\d+)([KMGR])\d+', tok)  # '4.99K1%' 少了分隔符：末尾数字是精度
+        if m:
+            return float(m.group(1)) * _R_MULT[m.group(2)], array_count
         m = re.fullmatch(r'(\d+(?:\.\d+)?)([KMGR]?)', tok)  # 10K / 100R / 0
         if m:
             return float(m.group(1)) * _R_MULT.get(m.group(2), 1), array_count
@@ -155,12 +166,13 @@ def parse_spec_c(spec):
 # ---------------- 电感/磁珠 ----------------
 
 def parse_l_value(text):
-    """'CR32-10uH'/'15uH'/'4R7' -> uH 或 None"""
+    """'CR32-10uH'/'15uH'/'4R7'/'1uH_10A'/'4.7u_2.8A' -> uH 或 None"""
     s = str(text).strip().upper()
-    m = re.search(r'(\d+(?:\.\d+)?)\s*(UH|MH|NH)\b', s)
+    # 单位后面不能再接字母；'_' 不算（'1uH_10A' 曾因 \\b 认不出）
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(UH|MH|NH|U)(?![A-Z])', s)
     if m:
         val = float(m.group(1))
-        return val * {'UH': 1, 'MH': 1e3, 'NH': 1e-3}[m.group(2)]
+        return val * {'UH': 1, 'U': 1, 'MH': 1e3, 'NH': 1e-3}[m.group(2)]
     m = re.search(r'(\d+)R(\d+)', s)  # 4R7 -> 4.7uH
     if m:
         return float(m.group(1) + '.' + m.group(2))
@@ -176,7 +188,24 @@ def parse_series(text):
 
 def is_bead(part):
     u = str(part).upper()
-    return ('BEAD' in u or 'FEB' in u or u.startswith('MPZ') or '100MHZ' in u)
+    return ('BEAD' in u or 'FEB' in u or u.startswith(('MPZ', 'BLM')) or '100MHZ' in u)
+
+
+def bead_ohms(part):
+    """磁珠阻抗 Ω：'220R/100MHz'、'470Ohm/0603'、'BEAD/100R/0805'；Murata 'BLM21PG300SN1D' 300=30×10^0；
+    TDK 'MPZ2012S101A' 101=10×10^1。认不出返回 None"""
+    u = str(part).upper()
+    m = re.match(r'(?:BLM\d{2}[A-Z]{2}|MPZ\d{4}[A-Z])(\d{2})(\d)', u)
+    if m:
+        return int(m.group(1)) * 10 ** int(m.group(2))
+    m = re.search(r'(\d+)\s*(?:R|OHM|Ω|Ω|)', u)   # '46R0C-010' 也要认出 46
+    return int(m.group(1)) if m else None
+
+
+def parse_current_a(text):
+    """'1uH_10A' / '4.7u_2.8A' / '4.7uH,4.5A' -> 安培；没有返回 None"""
+    m = re.search(r'(?<![A-Z\d.])(\d+(?:\.\d+)?)\s*A(?![A-Z])', str(text).upper())
+    return float(m.group(1)) if m else None
 
 
 # ---------------- 连接器 ----------------
@@ -203,10 +232,49 @@ def header_pins(part, fp):
     m = re.search(r'HEADER[_-](\d+)[*Xx](\d+)', str(part).upper())
     if m:
         return m.group(1), m.group(2)
+    m = re.search(r'HEADER[\s_-]*(\d+)(?![\d*Xx])', str(part).upper())   # 'HEADER 6' 单排
+    if m:
+        return m.group(1), '1'
     m = re.search(r'(\d+)[Xx](\d+)P', str(fp).upper())
     if m:
         return m.group(1), m.group(2)
     return None
+
+
+def fp_pitch_mm(fp):
+    """封装名里的间距：'HDRV6W50P200_1X6' -> 2.0；'CON-2_0-2X15P-V' -> 2.0；认不出 None"""
+    s = str(fp).upper()
+    m = re.search(r'P(\d{3})(?:_|$)', s)            # IPC 排针 P200/P254/P125
+    if m:
+        return int(m.group(1)) / 100
+    m = re.search(r'(?:CON|J)[-_]?(\d)[._](\d{1,2})', s)   # CON-2_0 / J-1_25
+    if m:
+        return float(f'{m.group(1)}.{m.group(2)}')
+    return None
+
+
+def fp_orient(fp):
+    """封装名里的方向：HDRV…/-V → 'V'(立式)；HDRRA…/-RA/-H → 'RA'(卧式)；看不出 None"""
+    s = str(fp).strip().upper()
+    if re.search(r'HDRRA|[-_]RA(?:[-_]|$)|[-_]H(?:[-_]|$)', s):
+        return 'RA'
+    if re.search(r'HDRV|[-_]V(?:[-_]|$)', s):
+        return 'V'
+    return None
+
+
+def spec_orient(spec):
+    s = str(spec)
+    if '卧' in s:
+        return 'RA'
+    if '立' in s:
+        return 'V'
+    return None
+
+
+def spec_pitch_mm(spec):
+    m = re.search(r'(\d+(?:\.\d+)?)\s*MM', str(spec).upper())
+    return float(m.group(1)) if m else None
 
 
 # ---------------- 其他 ----------------
@@ -216,6 +284,14 @@ def parse_freq_mhz(text):
     s = str(text).strip().upper()
     m = re.search(r'(\d+(?:\.\d+)?)\s*M(?:HZ)?(?![A-Z0-9])', s)
     return float(m.group(1)) if m else None
+
+
+def spec_freqs_mhz(spec):
+    """编码表规格里所有频率值（MHz）：'SMD3225,14.318MHz,20ppM' -> [14.318]；KHz 换算成 MHz"""
+    s = str(spec).upper()
+    out = [float(x) for x in re.findall(r'(\d+(?:\.\d+)?)\s*MHZ', s)]
+    out += [float(x) / 1000 for x in re.findall(r'(\d+(?:\.\d+)?)\s*KHZ', s)]
+    return out
 
 
 def parse_volt(text):

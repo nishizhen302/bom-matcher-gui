@@ -16,7 +16,7 @@ import re
 import openpyxl
 
 from .parsers import NC_RE
-from .report import HEADER, UNMATCHED, MECH_PN
+from .report import HEADER, UNMATCHED, MECH_PN, ORIG_SHEET, read_catalog
 
 FINAL_HEADER = ['序号', '料号', '名称', '规格', '数量', '位号']
 SUMMARY_GREEN = 'C6EFCE'
@@ -32,11 +32,16 @@ def _is_summary(cells):
     return False
 
 
-def read_result(result_file):
-    """读回结果 Excel，分类为 (manual, details, specials, leftovers)。
-    detail 行格式统一为 [位号, 料号, 名称, 规格, 数量]。"""
+def read_result(result_file, code_lookup=None):
+    """读回结果 Excel，分类为 (manual, details, specials, leftovers, n_filled)。
+    detail 行格式统一为 [位号, 料号, 名称, 规格, 数量]。
+    名称/规格以料号为准补齐：先查编码表 code_lookup（手填料号也能对上），
+    再查结果文件里的隐藏候选库（下拉换的料）；n_filled 为实际改动行数。"""
     wb = openpyxl.load_workbook(result_file)
-    ws = wb.active
+    ws = wb.worksheets[0]
+    catalog = read_catalog(wb)
+    catalog.update(code_lookup or {})
+    n_filled = 0
     header = [str(c.value or '').strip() for c in ws[1][:len(HEADER)]]
     if header[:5] != HEADER[:5]:
         raise ValueError(f"表头不是本工具的匹配结果格式（期望 {HEADER[:5]}...，实际 {header[:5]}）")
@@ -55,6 +60,11 @@ def read_result(result_file):
             continue
         if pn == MECH_PN:
             continue
+        if pn.upper() in catalog:      # 手敲小写也认
+            pn = pn.upper()
+        if pn in catalog and (name, spec) != catalog[pn]:
+            name, spec = catalog[pn]
+            n_filled += 1
         item = [ref, pn, name, spec, qty]
         if pn == UNMATCHED:
             leftovers.append(item)
@@ -66,7 +76,30 @@ def read_result(result_file):
             details.append(item)
         else:
             specials.append(item)
-    return manual, details, specials, leftovers
+    return manual, details, specials, leftovers, n_filled
+
+
+def collect_manual_picks(result_file):
+    """用户在 Excel 里改过料号的行（对比隐藏页「引擎原结果」）→ [(Part, 封装, 料号, 位号)]。
+    旧版结果文件没有该隐藏页：返回 []（不猜）。"""
+    wb = openpyxl.load_workbook(result_file)
+    if ORIG_SHEET not in wb.sheetnames:
+        return []
+    orig = {}
+    for ref, part, fp, pn in wb[ORIG_SHEET].iter_rows(min_row=2, max_col=4, values_only=True):
+        if ref:
+            orig[str(ref).strip()] = (str(part or '').strip(), str(fp or '').strip(), str(pn or '').strip())
+    picks = []
+    for row in wb.worksheets[0].iter_rows(min_row=2):
+        cells = row[:len(HEADER)]
+        v = [str(c.value or '').strip() for c in cells] + [''] * len(HEADER)
+        ref, pn = v[0], v[4]
+        if not ref or ref not in orig or _is_summary(cells):
+            continue
+        part, fp, old = orig[ref]
+        if pn and pn != old and pn not in (UNMATCHED, MECH_PN) and not NC_RE.search(part.upper()):
+            picks.append((part, fp, pn, ref))
+    return picks
 
 
 def aggregate(details):
@@ -128,14 +161,25 @@ def write_final(manual, aggregated, specials, leftovers, output_file):
     wb.save(output_file)
 
 
-def finalize(result_file, output_file=None, log=print):
-    """入口：结果 Excel -> <原名>_生产版.xlsx，返回输出路径。"""
+def finalize(result_file, output_file=None, log=print, code_lookup=None, stopped=()):
+    """入口：结果 Excel -> <原名>_生产版.xlsx，返回输出路径。
+    code_lookup: 编码表 {料号: (名称, 规格)}；stopped: 停用料号集合（填了要警告）。"""
     if not output_file:
         base, ext = os.path.splitext(result_file)
         output_file = base + '_生产版' + (ext or '.xlsx')
 
-    manual, details, specials, leftovers = read_result(result_file)
+    manual, details, specials, leftovers, n_filled = read_result(result_file, code_lookup)
     aggregated = aggregate(details)
+    if n_filled:
+        log(f"{n_filled} 行按料号从编码表补齐了名称/规格")
+    filled = manual + details + specials
+    bad_stop = [f"{x[0] or '(无位号)'}={x[1]}" for x in filled if x[1].upper() in stopped]
+    if bad_stop:
+        log(f"警告: {len(bad_stop)} 行填的是停用料，请换料: {'、'.join(bad_stop)}")
+    stale = [f"{x[0] or '(无位号)'}={x[1]}" for x in filled
+             if x[2] in ('', UNMATCHED) and x[1].upper() not in stopped]
+    if stale:
+        log(f"警告: {len(stale)} 行的料号在编码表里查不到、名称也没填，请核对料号: {'、'.join(stale)}")
     if leftovers:
         refs = '、'.join(x[0] or '(无位号)' for x in leftovers)
         log(f"警告: {len(leftovers)} 行未填料号，已保留黄色置于表尾: {refs}")

@@ -97,3 +97,78 @@ def test_finalize_rejects_foreign_file(tmp_path):
     wb.save(path)
     with pytest.raises(ValueError):
         finalize(path, log=lambda m: None)
+
+
+class _E:
+    def __init__(self, name, spec):
+        self.name, self.spec = name, spec
+
+
+def test_pick_candidate_by_dropdown(tmp_path):
+    """2026-10-18：带候选的行料号格可下拉换料，生产版按选中料号补齐名称/规格（不用手抄）。"""
+    catalog = {'Y0604-00010': _E('贴片电感', 'SMPA0503-4R7MT,4.7uH'),
+               'Y0604-00033': _E('贴片电感', 'SLO0520H4R7MTT,4.7uH'),
+               'Y0612-00114': _E('IC', 'LT87121,VBO转DP')}
+    rows = [
+        ['L1', '4.7uH', 'IND', '1', 'Y0604-00010', '贴片电感', 'SMPA0503-4R7MT,4.7uH',
+         'Y0604-00033: SLO0520H4R7MTT,4.7uH', '感值4.7uH [需确认]'],
+        ['L2', '4.7uH', 'IND', '1', 'Y0604-00010', '贴片电感', 'SMPA0503-4R7MT,4.7uH',
+         'Y0604-00033: SLO0520H4R7MTT,4.7uH', '感值4.7uH [需确认]'],
+        ['U3', 'LT87121', 'QFN64', '1', report.UNMATCHED, report.UNMATCHED, report.UNMATCHED,
+         'Y0612-00114: LT87121,VBO转DP; Y9999-99999: 编码表里没有', '编码表无对应料'],
+        ['R1', '10K', 'R0402', '1', 'Y0601-00050', '贴片电阻', '10K', '', ''],
+    ]
+    report.sort_rows(rows)
+    result = str(tmp_path / '结果.xlsx')
+    report.write_excel(rows, result, catalog=catalog)
+
+    wb = openpyxl.load_workbook(result)
+    ws = wb.worksheets[0]
+    assert wb[report.CATALOG_SHEET].sheet_state == 'hidden'
+    dv_of = {}
+    for dv in ws.data_validations.dataValidation:
+        for rng in dv.sqref.ranges:
+            dv_of[rng.coord] = dv.formula1
+    row_of = {str(r[0].value): r[0].row for r in ws.iter_rows(min_row=2)}
+    assert dv_of[f'E{row_of["L1"]}'] == '"Y0604-00010,Y0604-00033"'   # 当前料号排第一
+    assert dv_of[f'E{row_of["U3"]}'] == '"Y0612-00114"'               # 编码表里没有的候选不进下拉
+    assert f'E{row_of["R1"]}' not in dv_of                             # 没候选的行不加下拉
+
+    # 模拟在 Excel 里下拉：L1 换候选、U3 选候选，名称/规格都没动
+    ws.cell(row=row_of['L1'], column=5).value = 'Y0604-00033'
+    ws.cell(row=row_of['U3'], column=5).value = 'Y0612-00114'
+    wb.save(result)
+
+    logs = []
+    out = finalize(result, log=logs.append)
+    got = {r[1]: r for r in openpyxl.load_workbook(out).active.iter_rows(min_row=2, values_only=True)}
+    assert got['Y0604-00033'][2:6] == ('贴片电感', 'SLO0520H4R7MTT,4.7uH', '1', 'L1')
+    assert got['Y0604-00010'][3:6] == ('SMPA0503-4R7MT,4.7uH', '1', 'L2')
+    assert got['Y0612-00114'][2:4] == ('IC', 'LT87121,VBO转DP')
+    assert any(m.startswith('2 行按料号') for m in logs)
+
+
+def test_handfilled_pn_looked_up_in_code_table(tmp_path):
+    """2026-10-18：没匹配上的行只手填料号（名称还是「未匹配」），生产版按编码表补名称/规格。"""
+    rows = [
+        ['U3', 'LT87121', 'QFN64', '1', report.UNMATCHED, report.UNMATCHED, report.UNMATCHED, '', '编码表无对应料'],
+        ['U4', 'XX', 'SOT23', '1', report.UNMATCHED, report.UNMATCHED, report.UNMATCHED, '', '编码表无对应料'],
+        ['U5', 'YY', 'SOT23', '1', report.UNMATCHED, report.UNMATCHED, report.UNMATCHED, '', '编码表无对应料'],
+    ]
+    result = str(tmp_path / '结果.xlsx')
+    report.write_excel(rows, result)
+    wb = openpyxl.load_workbook(result)
+    ws = wb.worksheets[0]
+    typed = {'U3': ' y0612-00114 ', 'U4': 'Y0601-00141', 'U5': 'Y0000-00000'}  # 小写带空格/停用料/编码表没有
+    for r in ws.iter_rows(min_row=2):
+        r[4].value = typed[str(r[0].value)]
+    wb.save(result)
+
+    logs = []
+    out = finalize(result, log=logs.append,
+                   code_lookup={'Y0612-00114': ('集成电路', 'LT87121，VBO转DP')},
+                   stopped={'Y0601-00141'})
+    got = {r[5]: r for r in openpyxl.load_workbook(out).active.iter_rows(min_row=2, values_only=True)}
+    assert got['U3'][1:4] == ('Y0612-00114', '集成电路', 'LT87121，VBO转DP')
+    assert any('停用料' in m and 'U4' in m for m in logs)
+    assert any('查不到' in m and 'U5' in m and 'U3' not in m for m in logs)

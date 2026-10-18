@@ -12,6 +12,18 @@ MECH_PN = '非采购项'
 HEADER = ['位号', 'Part Value', 'PCB Footprint', 'Quantity', '料号', '名称', '规格', '候选料号', '匹配说明']
 N_COLS = len(HEADER)
 
+# 隐藏页：带候选的行里出现的每个料号的完整名称/规格。
+# 「料号」格下拉换成候选后，生产版据此补齐名称/规格（Excel 里不用手抄）
+CATALOG_SHEET = '候选料号库'
+ORIG_SHEET = '引擎原结果'
+
+
+def candidate_pns(r):
+    """候选列 'PN: spec; PN: spec' → [PN...]"""
+    if len(r) <= 7 or not r[7]:
+        return []
+    return [c.split(':', 1)[0].strip() for c in str(r[7]).split('; ') if c.strip()]
+
 
 def _is_nc(part):
     return bool(NC_RE.search(str(part).upper()))
@@ -59,7 +71,57 @@ def add_companions(rows, companions, by_pn, log):
     return rows
 
 
-def write_excel(rows, output_file):
+def _add_pick_lists(wb, ws, data_rows, catalog):
+    """带候选的明细行：料号格加下拉（当前料号+候选），候选的名称/规格写进隐藏页。
+    不拦手输——编码表里有、但没进候选的料仍可直接敲。"""
+    from openpyxl.worksheet.datavalidation import DataValidation
+    lists = {}      # 下拉内容 -> [行号]
+    known = {}      # 料号 -> (名称, 规格)
+    for row_num, r in data_rows:
+        cands = [p for p in candidate_pns(r) if p in catalog]  # 规格里带 '; ' 时切出的碎片不算
+        if not cands:
+            continue
+        opts = ([r[4]] if r[4] not in (UNMATCHED, MECH_PN, '') else []) + \
+               [p for p in cands if p != r[4]]
+        # Excel 内联下拉上限 255 字符，超出截掉末尾候选
+        while opts and len(','.join(opts)) > 250:
+            opts.pop()
+        if not opts:
+            continue
+        lists.setdefault(','.join(opts), []).append(row_num)
+        for pn in opts:
+            e = catalog.get(pn)
+            if e is not None:
+                known[pn] = (e.name, e.spec)
+    if not lists:
+        return
+    for opts, row_nums in lists.items():
+        dv = DataValidation(type='list', formula1=f'"{opts}"', allow_blank=True,
+                            showErrorMessage=False, showInputMessage=True,
+                            promptTitle='选料号', prompt='下拉可换成候选料号；名称/规格在生成生产版时自动补齐')
+        ws.add_data_validation(dv)
+        for n in row_nums:
+            dv.add(f'E{n}')
+    cs = wb.create_sheet(CATALOG_SHEET)
+    cs.append(['料号', '名称', '规格'])
+    for pn in sorted(known):
+        cs.append([pn, *known[pn]])
+    cs.sheet_state = 'hidden'
+
+
+def read_catalog(wb):
+    """结果文件里的隐藏候选库 → {料号: (名称, 规格)}；旧版结果文件没有就返回 {}。"""
+    if CATALOG_SHEET not in wb.sheetnames:
+        return {}
+    out = {}
+    for pn, name, spec in wb[CATALOG_SHEET].iter_rows(min_row=2, max_col=3, values_only=True):
+        if pn:
+            out[str(pn).strip()] = (str(name or ''), str(spec or ''))
+    return out
+
+
+def write_excel(rows, output_file, catalog=None):
+    """catalog: 料号 -> 编码表条目（有 .name/.spec），给出时为带候选的行生成下拉选料。"""
     aggregatable = lambda r: (not _is_nc(r[1])) and r[4] not in (UNMATCHED, MECH_PN)
     pn_counts = {}
     for r in rows:
@@ -102,9 +164,12 @@ def write_excel(rows, output_file):
     for col in range(1, N_COLS + 1):
         ws.cell(row=1, column=col).border = border
 
+    data_rows = []
     for row_type, data, is_rep in write_rows:
         row_num = ws.max_row + 1
         ws.append(data[:N_COLS] + [''] * (N_COLS - len(data)))
+        if row_type == 'data':
+            data_rows.append((row_num, data))
         fill = None
         if row_type == 'summary':
             fill = fills['green']
@@ -147,4 +212,12 @@ def write_excel(rows, output_file):
                 max_lines = max(max_lines, math.ceil(w / col_eff[cell.column]))
         ws.row_dimensions[row[0].row].height = max(30, max_lines * 15)
 
+    if catalog:
+        _add_pick_lists(wb, ws, data_rows, catalog)
+    # 隐藏页存匹配时的原料号：生成生产版时比对出用户在 Excel 里改过哪些，记进人工选择
+    os_ = wb.create_sheet(ORIG_SHEET)
+    os_.append(['位号', 'Part', 'PCB Footprint', '料号'])
+    for _n, d in data_rows:
+        os_.append([d[0], d[1], d[2], d[4]])
+    os_.sheet_state = 'hidden'
     wb.save(output_file)

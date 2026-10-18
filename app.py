@@ -6,6 +6,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -17,8 +18,11 @@ from datetime import datetime
 
 import webview
 
+import dsn_reader
 import engine
+import excel_bridge
 import version
+from bom_matcher import learned as LR
 
 
 def resource_path(rel):
@@ -28,6 +32,10 @@ def resource_path(rel):
 
 CONFIG_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'BomMatcher')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
+# 编码表存一份副本：桌面上的原文件被挪走/删掉也照样能用
+CODE_DIR = os.path.join(CONFIG_DIR, 'code_table')
+# 人工选择记忆：「Part 写法 + 封装」→ 料号，下次同样写法优先沿用
+LEARNED_FILE = os.path.join(CONFIG_DIR, 'learned.json')
 
 
 def _load_config():
@@ -57,6 +65,7 @@ class Api:
         self.output_file = None
         self.session = None
         self.busy = False
+        self._lookup_cache = (None, None)    # ((路径, 修改时间), (料号表, 停用集合))
 
     # ---------- 窗口控制 ----------
     def win_minimize(self):
@@ -135,10 +144,12 @@ class Api:
             size_s = f"{size / 1024:.1f} KB"
         return {'path': path, 'name': os.path.basename(path), 'size': size_s}
 
-    def _pick_excel(self):
+    def _pick_excel(self, allow_dsn=False):
+        types = ('Excel 文件 (*.xlsx;*.xls)', '所有文件 (*.*)')
+        if allow_dsn:
+            types = ('BOM Excel 或 OrCAD 原理图 (*.xlsx;*.xls;*.dsn)',) + types
         r = self._window.create_file_dialog(
-            webview.OPEN_DIALOG, allow_multiple=False,
-            file_types=('Excel 文件 (*.xlsx;*.xls)', '所有文件 (*.*)'))
+            webview.OPEN_DIALOG, allow_multiple=False, file_types=types)
         if r:
             return r[0] if isinstance(r, (list, tuple)) else r
         return None
@@ -149,7 +160,7 @@ class Api:
         return os.path.join(base, f'BOM_匹配结果_{stamp}.xlsx')
 
     def pick_bom(self):
-        p = self._pick_excel()
+        p = self._pick_excel(allow_dsn=True)
         if not p:
             return None
         return self.set_file('bom', p)
@@ -170,8 +181,21 @@ class Api:
         """kind: bom|code|final。拖放与对话框共用入口。"""
         if not path or not os.path.isfile(path):
             return {'error': '文件不存在'}
+        if kind == 'bom' and path.lower().endswith('.dsn'):
+            # 拖入时先读一遍：OrCAD 缺失/打不开/没编号当场报，不等到点开始
+            try:
+                parts = dsn_reader.read_parts(path)
+            except dsn_reader.DsnError as e:
+                return {'error': str(e)}
+            n_rows = len(dsn_reader.group_rows(parts))
+            self.bom_file = path
+            self.output_file = self._default_output()
+            info = self._file_info(path)
+            info['meta'] = f'OrCAD 原理图 · {len(parts)} 个元件 → {n_rows} 行'
+            return info
         if not path.lower().endswith(('.xlsx', '.xls')):
-            return {'error': '请选择 Excel 文件 (.xlsx/.xls)'}
+            return {'error': '请选择 Excel 文件 (.xlsx/.xls)' +
+                    ('，或 OrCAD 原理图 (.DSN)' if kind == 'bom' else '')}
         if kind == 'bom':
             self.bom_file = path
             # 输出固定跟 BOM 源文件同路径（UI 已去掉输出文件框）
@@ -179,8 +203,55 @@ class Api:
         elif kind == 'final':
             self.final_file = path
         else:
-            self.code_file = path
+            return self._remember_code(path)
         return self._file_info(path)
+
+    # ---------- 编码表记忆：拖一次存副本，下次启动自动载入；拖新的就替换 ----------
+    def _code_lookup(self, path):
+        key = (path, os.path.getmtime(path))
+        if self._lookup_cache[0] != key:
+            self._lookup_cache = (key, engine.load_code_lookup(path))
+        return self._lookup_cache[1]
+
+    def _remember_code(self, path):
+        try:
+            lookup, _stopped = self._code_lookup(path)
+        except Exception as e:
+            return {'error': f'这个文件读不成编码表：{e}'}
+        try:
+            os.makedirs(CODE_DIR, exist_ok=True)
+            copy = os.path.join(CODE_DIR, os.path.basename(path))
+            if os.path.abspath(copy) != os.path.abspath(path):
+                for old in os.listdir(CODE_DIR):
+                    os.remove(os.path.join(CODE_DIR, old))
+                shutil.copy2(path, copy)
+            cfg = _load_config()
+            cfg['code_table'] = {'source': path, 'copy': copy,
+                                 'source_mtime': os.path.getmtime(path),
+                                 'saved': datetime.now().strftime('%Y-%m-%d %H:%M')}
+            _save_config(cfg)
+            self.code_file = copy
+        except OSError:
+            self.code_file = path    # 存副本失败也不耽误这次用
+        info = self._file_info(path)
+        info['meta'] = f'{len(lookup)} 条料号 · 已记住，下次自动载入'
+        return info
+
+    def restore_code(self):
+        """启动时载入上次的编码表。原文件还在且改过 → 用新的重新记一次。"""
+        ct = _load_config().get('code_table') or {}
+        src, copy = ct.get('source'), ct.get('copy')
+        if src and os.path.isfile(src) and os.path.getmtime(src) != ct.get('source_mtime'):
+            info = self._remember_code(src)
+            if not info.get('error'):
+                info['meta'] = '原文件有更新，已重新载入 · ' + info['meta'].split(' · ')[0]
+                return info
+        if copy and os.path.isfile(copy):
+            self.code_file = copy
+            info = self._file_info(copy)
+            info['meta'] = f'上次的编码表 · {ct.get("saved", "")} 载入 · 变了就拖新的'
+            return info
+        return None
 
     # ---------- 匹配 ----------
     def start_match(self):
@@ -240,20 +311,28 @@ class Api:
         try:
             res = engine.process_bom(
                 self.bom_file, self.code_file, self.output_file,
-                log_callback=log_cb, progress_callback=prog_cb)
+                log_callback=log_cb, progress_callback=prog_cb,
+                learned=LR.load(LEARNED_FILE))
             # 引擎导出时会按料号原地重排序 results —— 复核行必须持有行对象引用
             review_rows = [r for r in res['results'] if r[4] == '未匹配']
             res['review_rows'] = review_rows
             res['dtype_map'] = dtype_map
             res['confirmed'] = set()
             self.session = res
+            # 结果表直接接进生产版区：Excel 里审完保存，回来点「生成生产版」即可，不用再拖
+            self.final_file = str(res['output_file'])
+            final_info = self._file_info(self.final_file)
+            final_info['meta'] = '本次匹配结果 · 在 Excel 里审完保存后点下面按钮'
             matched = sum(1 for r in res['results']
                           if r[4] != '未匹配' and r[0] != 'AUTO')
             total = row_n[0]
             self._push({'type': 'done', 'output_file': str(res['output_file']),
+                        'final': final_info,
                         'total': total, 'matched': matched,
                         'unmatched': len(review_rows), 'cat_stats': cat_stats})
             self._push({'type': 'elapsed', 'seconds': round(time.time() - t0, 2)})
+        except dsn_reader.DsnError as e:
+            self._push({'type': 'error', 'message': str(e)})
         except Exception as e:
             self._push({'type': 'error', 'message': f'{type(e).__name__}: {e}'})
         finally:
@@ -336,6 +415,13 @@ class Api:
         except (IndexError, ValueError):
             return {'error': '行不存在'}
         r[4], r[5], r[6] = code, name, spec
+        store = LR.load(LEARNED_FILE)
+        board = os.path.splitext(os.path.basename(self.bom_file or ''))[0]
+        if LR.remember(store, r[1], r[2], code, name, spec, board):
+            try:
+                LR.save(LEARNED_FILE, store)
+            except OSError:
+                pass
         return self._reexport()
 
     def mark_confirmed_nomatch(self, row_index):
@@ -391,25 +477,89 @@ class Api:
             self._on_drop, prevent_default=True, stop_propagation=False)
 
     # ---------- 生产版（审核后清理导出） ----------
-    def make_final(self):
-        """把拖入的审核后结果 Excel 清理聚合成 <原名>_生产版.xlsx（同路径）。
-        不依赖匹配会话，历史结果文件也可用；不自动打开，由界面提示完成状态。"""
+    def make_final(self, mode='check'):
+        """把审核后结果 Excel 清理聚合成 <原名>_生产版.xlsx（同路径）。
+        不依赖匹配会话，历史结果文件也可用；不自动打开，由界面提示完成状态。
+        结果表还在 Excel 里开着时直接问 Excel 存没存（不让用户自己"确认"）：
+          mode='check' 已保存/没开着→生成；有改动→回 need=dirty；问不到→回 need=unknown
+          mode='save'  替用户在 Excel 里保存后生成
+          mode='force' 仅用于问不到的情况（WPS/残留锁文件），用户声明没开着"""
         from bom_matcher.finalize import finalize
         if not self.final_file:
             return {'error': '请先拖入审核后的匹配结果文件'}
+        name = os.path.basename(self.final_file)
+        st = excel_bridge.status(self.final_file)
+        if st == excel_bridge.DIRTY:
+            if mode != 'save':
+                return {'need': 'dirty', 'file': name}
+            err = excel_bridge.save(self.final_file)
+            if err:
+                return {'error': err}
+        elif st == excel_bridge.UNKNOWN and mode != 'force':
+            return {'need': 'unknown', 'file': name}
         logs = []
+        lookup, stopped = {}, set()
+        if self.code_file and os.path.isfile(self.code_file):
+            try:
+                lookup, stopped = self._code_lookup(self.code_file)
+            except Exception:
+                logs.append('警告: 编码表读取失败，手填的料号没法自动补名称/规格')
+        else:
+            logs.append('警告: 没载入编码表，手填的料号没法自动补名称/规格')
         try:
-            out = finalize(self.final_file, log=logs.append)
+            out = finalize(self.final_file, log=logs.append,
+                           code_lookup=lookup, stopped=stopped)
         except PermissionError:
             return {'error': '写入失败：生产版文件正被 Excel 占用，请先关闭它'}
         except ValueError as e:
             return {'error': str(e)}
         except Exception as e:
             return {'error': f'生成失败: {type(e).__name__}: {e}'}
-        warn = next((m for m in logs if m.startswith('警告')), '')
+        n_learned = self._learn_from_result(self.final_file, lookup)
+        if n_learned:
+            logs.append(f'记住了 {n_learned} 条人工选择，下次同样的写法直接配上')
+        warn = '\n'.join(m for m in logs if m.startswith('警告'))
+        info = '；'.join(m for m in logs if '补齐' in m or '记住了' in m)
         self.final_output = out
-        return {'ok': True, 'output': out,
-                'name': os.path.basename(out), 'warn': warn}
+        return {'ok': True, 'output': out, 'name': os.path.basename(out),
+                'warn': warn, 'info': info}
+
+    def _learn_from_result(self, result_file, lookup):
+        """Excel 里改过料号的行记进人工选择；料号必须在编码表里（敲错的不记）。"""
+        from bom_matcher.finalize import collect_manual_picks
+        try:
+            picks = collect_manual_picks(result_file)
+        except Exception:
+            return 0
+        store, n = LR.load(LEARNED_FILE), 0
+        board = os.path.basename(os.path.dirname(os.path.abspath(result_file)))
+        for part, fp, pn, _ref in picks:
+            rec = lookup.get(pn.upper())
+            if rec and LR.remember(store, part, fp, pn.upper(), rec[0], rec[1], board):
+                n += 1
+        if n:
+            try:
+                LR.save(LEARNED_FILE, store)
+            except OSError:
+                return 0
+        return n
+
+    # ---------- 人工选择记忆管理 ----------
+    def list_learned(self):
+        store = LR.load(LEARNED_FILE)
+        items = [dict(v, key=k) for k, v in store.items()]
+        items.sort(key=lambda x: x.get('date', ''), reverse=True)
+        return items
+
+    def forget_learned(self, key):
+        store = LR.load(LEARNED_FILE)
+        if store.pop(key, None) is None:
+            return {'error': '这条已经不在了'}
+        LR.save(LEARNED_FILE, store)
+        return {'ok': True, 'count': len(store)}
+
+    def learned_count(self):
+        return len(LR.load(LEARNED_FILE))
 
     def open_final(self):
         if self.final_output and os.path.isfile(self.final_output):

@@ -82,33 +82,52 @@ def _emit_row(refdes, part, fp, dtype, pn):
             pass
 
 
-def process_bom(bom_file, code_file, output_file=None, log_callback=None, progress_callback=None):
-    """供GUI直接调用的入口函数"""
+def load_code_lookup(code_file):
+    """编码表 → ({料号: (名称, 规格)}, 停用料号集合)，给生产版按手填料号补名称/规格用。"""
+    entries, discontinued, _sheets = load_code(code_file)
+    lookup = {e.pn.upper(): (e.name, e.spec) for e in entries}
+    return lookup, {e.pn.upper() for e in discontinued}
+
+
+def process_bom(bom_file, code_file, output_file=None, log_callback=None, progress_callback=None, learned=None):
+    """供GUI直接调用的入口函数。learned: 人工选择记忆 dict（见 bom_matcher.learned）"""
     _set_log_callback(log_callback)
     _set_progress_callback(progress_callback)
-    return main(bom=bom_file, code=code_file, output=output_file)
+    return main(bom=bom_file, code=code_file, output=output_file, learned=learned)
 
 
-def main(bom=None, code=None, output=None, verbose=False, debug=False):
+def main(bom=None, code=None, output=None, verbose=False, debug=False, learned=None):
     cli = bom is None and code is None
     if cli:
         parser = argparse.ArgumentParser(description='BOM智能匹配工具')
         parser.add_argument('--bom')
         parser.add_argument('--code')
         parser.add_argument('--output')
+        parser.add_argument('--learned', metavar='learned.json', help='人工选择记忆文件，有则优先沿用')
         parser.add_argument('--finalize', metavar='结果.xlsx',
                             help='读回人工审核后的结果文件，生成 <原名>_生产版.xlsx')
         args = parser.parse_args()
         if args.finalize:
             from bom_matcher.finalize import finalize
-            return finalize(args.finalize, args.output, log=_log)
+            lookup, stopped = load_code_lookup(args.code) if args.code else ({}, set())
+            return finalize(args.finalize, args.output, log=_log,
+                            code_lookup=lookup, stopped=stopped)
         if not (args.bom and args.code):
             parser.error('--bom 和 --code 为必填（除非使用 --finalize）')
         bom, code, output = args.bom, args.code, args.output
+        if args.learned:
+            from bom_matcher import learned as LR
+            learned = LR.load(args.learned)
 
     output = output or os.path.join(
         os.path.dirname(os.path.abspath(bom)),
         f"BOM_匹配结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+
+    if bom.lower().endswith('.dsn'):
+        # 原理图直接匹配：每次开始都重读，拖入后又在 OrCAD 里改过存过也能跟上
+        import dsn_reader
+        bom, n_parts, n_rows = dsn_reader.dsn_to_bom(bom)
+        _log(f"原理图读出 {n_parts} 个元件 → {n_rows} 行 BOM，已另存: {os.path.basename(bom)}")
 
     bom_rows, cols = load_bom(bom)
     entries, discontinued, sheets = load_code(code)
@@ -117,7 +136,7 @@ def main(bom=None, code=None, output=None, verbose=False, debug=False):
     _progress(15, '加载文件完成')
 
     extra_alias, banned = load_user_rules(os.path.dirname(os.path.abspath(__file__)))
-    eng = Engine(entries, extra_alias, banned)
+    eng = Engine(entries, extra_alias, banned, learned=learned)
 
     items = []
     need = [c for c in (cols['ref'], cols['part'], cols['fp'], cols['qty']) if c is not None]
@@ -160,6 +179,10 @@ def main(bom=None, code=None, output=None, verbose=False, debug=False):
             unmatched.append((it.refdes, it.part, it.fp))
             _emit_row(it.refdes, it.part, it.fp, dtype, report.UNMATCHED)
 
+    if eng.learned_used:
+        _log(f"沿用人工选择 {eng.learned_used} 行")
+    for ref, part, pn in eng.learned_skipped:
+        _log(f"警告: {ref} {part} 记住的料号 {pn} 已不在编码表里（停用或删除），这次没沿用")
     _progress(75, '匹配完成，正在生成输出...')
 
     def export_results(res_list, out_path=None):
@@ -169,7 +192,7 @@ def main(bom=None, code=None, output=None, verbose=False, debug=False):
                 r[7], r[8] = '', '人工指定'
         report.add_companions(res_list, COMPANIONS, eng.by_pn, _log)
         report.sort_rows(res_list)
-        report.write_excel(res_list, out_path or output)
+        report.write_excel(res_list, out_path or output, catalog=eng.by_pn)
 
     export_results(results)
     _progress(100, '完成')
